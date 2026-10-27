@@ -1,0 +1,32 @@
+# Build output
+bin/
+obj/
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+[Aa]rm64/
+publish/
+artifacts/
+*.nupkg
+
+# IDE / editor
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.userprefs
+*.DotSettings.user
+
+# Test / coverage
+TestResults/
+coverage*/
+*.coverage
+
+# Logs & misc
+*.log
+*.tmp
+Thumbs.db
+Desktop.ini
+.DS_Store
