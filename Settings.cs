@@ -5,9 +5,12 @@ namespace BreakPlease;
 
 public class Settings
 {
-    public int IntervalMinutes { get; set; } = 20;
+    // The break comes at the first quiet moment between Min and Max minutes, or at Max anyway.
+    public int MinIntervalMinutes { get; set; } = 20;
+    public int MaxIntervalMinutes { get; set; } = 25;
+    public int QuietSeconds { get; set; } = 10;
     public int BreakSeconds { get; set; } = 20;
-    public int WarningSeconds { get; set; } = 10;
+    public int WarningSeconds { get; set; } = 5;
     public int IdleResetSeconds { get; set; } = 120;
     public bool DetectMeetings { get; set; } = true;
     public bool StartWithWindows { get; set; } = true;

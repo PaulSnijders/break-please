@@ -6,7 +6,11 @@ namespace BreakPlease;
 class TrayApp : ApplicationContext
 {
     static readonly TimeSpan MeetingCheckInterval = TimeSpan.FromSeconds(5);
-    static readonly TimeSpan PostponeTime = TimeSpan.FromMinutes(5);
+    static readonly TimeSpan SnoozeTime = TimeSpan.FromMinutes(1);
+    // Ticks are 0.5 s apart; a bigger gap means the computer was asleep (or the app was suspended).
+    static readonly TimeSpan SleepGap = TimeSpan.FromSeconds(30);
+    static readonly TimeSpan PhotoRefreshInterval = TimeSpan.FromHours(6);
+    static readonly TimeSpan PhotoRetryInterval = TimeSpan.FromMinutes(10);
 
     readonly Settings settings = Settings.Load();
     readonly PhotoProvider photos = new();
@@ -14,15 +18,21 @@ class TrayApp : ApplicationContext
     readonly Icon activeIcon = CreateIcon(Color.FromArgb(46, 160, 120));
     readonly Icon disabledIcon = CreateIcon(Color.Gray);
     readonly ToolStripMenuItem statusItem = new() { Enabled = false };
-    readonly ToolStripMenuItem toggleItem = new("Pauzes uitzetten");
+    readonly ToolStripMenuItem[] pauseItems;
+    readonly ToolStripMenuItem resumeItem;
     readonly System.Windows.Forms.Timer tick = new() { Interval = 500 };
 
-    DateTime nextBreak;
+    // The break comes at the first quiet moment between windowStart and windowEnd, or at windowEnd anyway.
+    DateTime windowStart, windowEnd;
+    DateTime lastTick = DateTime.Now;
     DateTime? idleSince;
     DateTime lastMeetingCheck;
-    DateTime lastPhotoRefresh;
+    DateTime nextPhotoRefresh;
+    DateTime? pausedUntil; // DateTime.MaxValue: until turned back on
+    DateTime warningShown;
+    bool warningForced;
+    volatile bool locked; // set from the SystemEvents thread
     string? meetingApp;
-    bool disabled;
     WarningForm? warning;
     BreakSession? breakSession;
     SettingsForm? settingsForm;
@@ -30,22 +40,35 @@ class TrayApp : ApplicationContext
     public TrayApp()
     {
         Log.Cleanup();
-        Log.Write($"Gestart: elke {settings.IntervalMinutes} min, {settings.BreakSeconds}s pauze, reset na {settings.IdleResetSeconds}s inactief");
+        Log.Write($"Gestart: pauze na {settings.MinIntervalMinutes}-{settings.MaxIntervalMinutes} min, {settings.BreakSeconds}s pauze, reset na {settings.IdleResetSeconds}s inactief");
 #if !DEBUG
         settings.ApplyAutostart(); // keep the Run key pointing at the current exe
 #endif
+
+        pauseItems =
+        [
+            new("Pauzes 2 uur uitzetten", null, (_, _) => Pause(DateTime.Now.AddHours(2), "2 uur")),
+            new("Pauzes uitzetten tot morgen", null, (_, _) => Pause(DateTime.Today.AddDays(1), "tot morgen")),
+            new("Pauzes uitzetten", null, (_, _) => Pause(DateTime.MaxValue, "tot weer aangezet")),
+        ];
+        resumeItem = new("Pauzes weer aanzetten", null, (_, _) => Resume("handmatig"));
 
         var menu = new ContextMenuStrip();
         menu.Items.Add(statusItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Nu pauze", null, (_, _) => StartBreak("handmatig"));
-        menu.Items.Add(toggleItem);
+        menu.Items.AddRange(pauseItems);
+        menu.Items.Add(resumeItem);
         menu.Items.Add("Instellingen...", null, (_, _) => ShowSettings());
         menu.Items.Add("Logs openen", null, (_, _) => OpenLogs());
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Afsluiten", null, (_, _) => Exit());
-        menu.Opening += (_, _) => UpdateStatus();
-        toggleItem.Click += (_, _) => ToggleDisabled();
+        menu.Opening += (_, _) =>
+        {
+            foreach (var item in pauseItems) item.Visible = pausedUntil == null;
+            resumeItem.Visible = pausedUntil != null;
+            UpdateStatus();
+        };
 
         tray = new NotifyIcon { Icon = activeIcon, ContextMenuStrip = menu, Visible = true, Text = "Break Please" };
         tray.DoubleClick += (_, _) => ShowSettings();
@@ -58,19 +81,41 @@ class TrayApp : ApplicationContext
         tick.Start();
     }
 
-    void ResetTimer() => nextBreak = DateTime.Now.AddMinutes(settings.IntervalMinutes);
+    void ResetTimer()
+    {
+        windowStart = DateTime.Now.AddMinutes(settings.MinIntervalMinutes);
+        windowEnd = DateTime.Now.AddMinutes(Math.Max(settings.MinIntervalMinutes, settings.MaxIntervalMinutes));
+    }
 
     void OnTick()
     {
         var now = DateTime.Now;
+        bool slept = now - lastTick > SleepGap;
+        lastTick = now;
 
-        if (now - lastPhotoRefresh > TimeSpan.FromHours(12))
+        if (now >= nextPhotoRefresh)
         {
-            lastPhotoRefresh = now;
-            _ = photos.RefreshAsync();
+            nextPhotoRefresh = now + PhotoRefreshInterval;
+            RefreshPhotos();
         }
 
         if (breakSession != null) return;
+
+        if (slept)
+        {
+            Log.Write("Computer sliep: timer gereset");
+            CloseWarning();
+            ResetTimer();
+        }
+
+        // Locked counts as away: the timer starts fresh after unlocking.
+        if (locked)
+        {
+            CloseWarning();
+            ResetTimer();
+            UpdateStatus();
+            return;
+        }
 
         // Away from keyboard long enough: that counts as a break.
         var idle = Idle.Get();
@@ -95,34 +140,67 @@ class TrayApp : ApplicationContext
 
         CheckMeeting(now);
 
-        if (disabled)
+        if (pausedUntil != null)
         {
-            ResetTimer();
-            UpdateStatus();
-            return;
+            if (now < pausedUntil)
+            {
+                ResetTimer();
+                UpdateStatus();
+                return;
+            }
+            Resume("tijd voorbij");
         }
-
-        var remaining = nextBreak - now;
-        int warnSeconds = settings.WarningSeconds;
 
         if (meetingApp != null)
         {
-            // Keep the break pending; it comes shortly after the call ends.
+            // Keep the break pending; it comes at a quiet moment after the call, or a minute after it at the latest.
             CloseWarning();
-            var minimum = TimeSpan.FromSeconds(warnSeconds + 60);
-            if (remaining < minimum) nextBreak = now + minimum;
+            var minimum = now + SnoozeTime;
+            if (windowEnd < minimum) windowEnd = minimum;
         }
-        else if (remaining <= TimeSpan.Zero)
+        else if (warning != null)
         {
-            StartBreak("gepland");
-            return;
+            var shownFor = now - warningShown;
+            if (!warningForced && idle < shownFor)
+            {
+                Log.Write("Waarschuwing weg door activiteit: 1 min uitgesteld");
+                CloseWarning();
+                windowStart = now + SnoozeTime;
+            }
+            else if (shownFor.TotalSeconds >= settings.WarningSeconds)
+            {
+                StartBreak(warningForced ? "uiterlijke tijd" : "rustig moment");
+                return;
+            }
+            else
+            {
+                warning.SetSeconds((int)Math.Ceiling(settings.WarningSeconds - shownFor.TotalSeconds));
+            }
         }
-        else if (remaining.TotalSeconds <= warnSeconds)
+        else if (now >= windowEnd)
         {
-            ShowWarning((int)Math.Ceiling(remaining.TotalSeconds));
+            ShowWarning(forced: true);
+        }
+        else if (now >= windowStart && idle.TotalSeconds >= settings.QuietSeconds)
+        {
+            ShowWarning(forced: false);
         }
 
         UpdateStatus();
+    }
+
+    async void RefreshPhotos()
+    {
+        try
+        {
+            if (!await photos.RefreshAsync())
+                nextPhotoRefresh = DateTime.Now + PhotoRetryInterval;
+        }
+        catch (Exception ex)
+        {
+            Log.Write($"Foto's ophalen mislukt: {ex.Message}");
+            nextPhotoRefresh = DateTime.Now + PhotoRetryInterval;
+        }
     }
 
     void CheckMeeting(DateTime now)
@@ -141,28 +219,19 @@ class TrayApp : ApplicationContext
         meetingApp = app;
     }
 
-    void ShowWarning(int seconds)
+    void ShowWarning(bool forced)
     {
-        if (warning == null)
+        if (settings.WarningSeconds <= 0)
         {
-            Log.Write("Waarschuwing getoond");
-            warning = new WarningForm();
-            warning.PostponeClicked += () =>
-            {
-                Log.Write("Pauze 5 min uitgesteld");
-                CloseWarning();
-                nextBreak = DateTime.Now + PostponeTime;
-            };
-            warning.SkipClicked += () =>
-            {
-                Log.Write("Pauze overgeslagen (vanuit waarschuwing)");
-                CloseWarning();
-                ResetTimer();
-            };
-            warning.SetSeconds(seconds);
-            warning.Show();
+            StartBreak(forced ? "uiterlijke tijd" : "rustig moment");
+            return;
         }
-        warning.SetSeconds(seconds);
+        Log.Write(forced ? "Waarschuwing getoond (uiterlijke tijd)" : "Waarschuwing getoond (rustig moment)");
+        warningShown = DateTime.Now;
+        warningForced = forced;
+        warning = new WarningForm(dismissable: !forced);
+        warning.SetSeconds(settings.WarningSeconds);
+        warning.Show();
     }
 
     void CloseWarning()
@@ -187,24 +256,36 @@ class TrayApp : ApplicationContext
         breakSession.Start();
     }
 
-    void ToggleDisabled()
+    void Pause(DateTime until, string description)
     {
-        disabled = !disabled;
-        Log.Write(disabled ? "Pauzes uitgezet" : "Pauzes aangezet");
-        toggleItem.Text = disabled ? "Pauzes aanzetten" : "Pauzes uitzetten";
-        tray.Icon = disabled ? disabledIcon : activeIcon;
+        Log.Write($"Pauzes uitgezet ({description})");
+        pausedUntil = until;
+        tray.Icon = disabledIcon;
         CloseWarning();
+        UpdateStatus();
+    }
+
+    void Resume(string reason)
+    {
+        Log.Write($"Pauzes weer aan ({reason})");
+        pausedUntil = null;
+        tray.Icon = activeIcon;
         ResetTimer();
         UpdateStatus();
     }
 
     void UpdateStatus()
     {
+        var now = DateTime.Now;
         string status;
-        if (disabled) status = "Pauzes staan uit";
+        if (pausedUntil == DateTime.MaxValue) status = "Pauzes staan uit";
+        else if (pausedUntil != null) status = pausedUntil.Value.Date == now.Date ? $"Pauzes uit tot {pausedUntil:HH:mm}" : "Pauzes uit tot morgen";
+        else if (locked) status = "Vergrendeld, timer staat stil";
         else if (idleSince != null) status = "Inactief, timer staat stil";
         else if (meetingApp != null) status = $"In gesprek ({meetingApp})";
-        else status = $"Volgende pauze over {Format(nextBreak - DateTime.Now)}";
+        else if (warning != null) status = "Pauze komt eraan";
+        else if (now < windowStart) status = $"Volgende pauze over {Format(windowStart - now)} (uiterlijk {Format(windowEnd - now)})";
+        else status = $"Pauze bij eerste rustige moment (uiterlijk over {Format(windowEnd - now)})";
 
         statusItem.Text = status;
         var text = $"Break Please – {status}";
@@ -231,7 +312,8 @@ class TrayApp : ApplicationContext
                 {
                     MessageBox.Show($"Opslaan mislukt: {ex.Message}", "Break Please");
                 }
-                Log.Write($"Instellingen gewijzigd: elke {settings.IntervalMinutes} min, {settings.BreakSeconds}s pauze, " +
+                Log.Write($"Instellingen gewijzigd: pauze na {settings.MinIntervalMinutes}-{settings.MaxIntervalMinutes} min, " +
+                          $"rustig na {settings.QuietSeconds}s, {settings.BreakSeconds}s pauze, " +
                           $"waarschuwing {settings.WarningSeconds}s, reset na {settings.IdleResetSeconds}s, " +
                           $"meetings={settings.DetectMeetings}, autostart={settings.StartWithWindows}");
                 ResetTimer();
@@ -246,18 +328,25 @@ class TrayApp : ApplicationContext
         System.Diagnostics.Process.Start("explorer.exe", Log.Folder);
     }
 
+    // These run on the SystemEvents thread: only log and set flags, OnTick does the rest.
     void OnPowerModeChanged(object sender, PowerModeChangedEventArgs e)
     {
         if (e.Mode == PowerModes.Suspend) Log.Write("Slaapstand");
-        if (e.Mode != PowerModes.Resume) return;
-        Log.Write("Uit slaapstand: timer gereset");
-        ResetTimer();
+        if (e.Mode == PowerModes.Resume) Log.Write("Uit slaapstand");
     }
 
     void OnSessionSwitch(object sender, SessionSwitchEventArgs e)
     {
-        if (e.Reason == SessionSwitchReason.SessionLock) Log.Write("Scherm vergrendeld");
-        if (e.Reason == SessionSwitchReason.SessionUnlock) Log.Write("Scherm ontgrendeld");
+        if (e.Reason == SessionSwitchReason.SessionLock)
+        {
+            Log.Write("Scherm vergrendeld");
+            locked = true;
+        }
+        if (e.Reason == SessionSwitchReason.SessionUnlock)
+        {
+            Log.Write("Scherm ontgrendeld: timer gereset");
+            locked = false;
+        }
     }
 
     static string Format(TimeSpan t)

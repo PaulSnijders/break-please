@@ -8,28 +8,33 @@ public record Photo(Image Image, string Caption) : IDisposable
 }
 
 /// <summary>
-/// Downloads the Bing "photo of the day" images (last ~16 days, no API key needed)
-/// into a local cache, and picks a random one for each break.
+/// Downloads the Bing "photo of the day" images (last ~16 days per market, no API key needed)
+/// into a local cache, and picks a random one for each break, avoiding recently shown ones.
 /// </summary>
 class PhotoProvider
 {
     const int MaxCached = 150;
+    // Markets often have different photos; first market wins for the caption of shared ones.
+    static readonly string[] Markets = ["nl-NL", "en-US", "en-GB", "en-CA", "en-AU", "en-IN", "de-DE", "fr-FR"];
     static readonly HttpClient Http = new() { Timeout = TimeSpan.FromSeconds(30) };
 
     readonly Random random = new();
-    string? lastShown;
 
     static string Folder => Path.Combine(Settings.Dir, "photos");
+    static string HistoryFile => Path.Combine(Folder, "shown.txt");
 
-    public async Task RefreshAsync()
+    /// <summary>Returns false when nothing could be fetched (e.g. no network yet after waking up).</summary>
+    public async Task<bool> RefreshAsync()
     {
-        int added = 0;
-        try
+        int added = 0, failed = 0, requests = 0;
+        Directory.CreateDirectory(Folder);
+        foreach (var market in Markets)
+        foreach (var idx in new[] { 0, 7 })
         {
-            Directory.CreateDirectory(Folder);
-            foreach (var idx in new[] { 0, 7 })
+            requests++;
+            try
             {
-                var json = await Http.GetStringAsync($"https://www.bing.com/HPImageArchive.aspx?format=js&idx={idx}&n=8&mkt=nl-NL");
+                var json = await Http.GetStringAsync($"https://www.bing.com/HPImageArchive.aspx?format=js&idx={idx}&n=8&mkt={market}");
                 using var doc = JsonDocument.Parse(json);
                 foreach (var img in doc.RootElement.GetProperty("images").EnumerateArray())
                 {
@@ -46,13 +51,14 @@ class PhotoProvider
                     added++;
                 }
             }
-            if (added > 0) Log.Write($"{added} nieuwe foto's gedownload");
-            TrimCache();
+            catch (Exception ex)
+            {
+                if (failed++ == 0) Log.Write($"Foto's ophalen mislukt ({market}): {ex.Message}");
+            }
         }
-        catch (Exception ex)
-        {
-            Log.Write($"Foto's ophalen mislukt: {ex.Message}");
-        }
+        if (added > 0) Log.Write($"{added} nieuwe foto's gedownload");
+        try { TrimCache(); } catch { }
+        return failed < requests;
     }
 
     static void TrimCache()
@@ -75,9 +81,14 @@ class PhotoProvider
             var files = Directory.GetFiles(Folder, "*.jpg");
             if (files.Length == 0) return null;
 
-            var candidates = files.Length > 1 ? files.Where(f => f != lastShown).ToArray() : files;
+            // Skip the most recently shown half, so repeats are rare and new photos come up soon.
+            var history = File.Exists(HistoryFile) ? File.ReadAllLines(HistoryFile).ToList() : [];
+            var recent = history.TakeLast(files.Length / 2).ToHashSet();
+            var candidates = files.Where(f => !recent.Contains(Path.GetFileName(f))).ToArray();
+            if (candidates.Length == 0) candidates = files;
             var file = candidates[random.Next(candidates.Length)];
-            lastShown = file;
+            history.Add(Path.GetFileName(file));
+            File.WriteAllLines(HistoryFile, history.TakeLast(MaxCached));
 
             // Load via a copy so the file isn't locked.
             using var stream = new MemoryStream(File.ReadAllBytes(file));

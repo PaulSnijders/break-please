@@ -5,10 +5,8 @@ class WarningForm : Form
 {
     readonly Label label;
 
-    public event Action? PostponeClicked;
-    public event Action? SkipClicked;
-
-    public WarningForm()
+    /// <param name="dismissable">True when any mouse/keyboard input cancels the break (shown as a hint).</param>
+    public WarningForm(bool dismissable)
     {
         FormBorderStyle = FormBorderStyle.None;
         StartPosition = FormStartPosition.Manual;
@@ -21,13 +19,7 @@ class WarningForm : Form
         Font = new Font("Segoe UI", 10f);
         Padding = new Padding(14, 10, 14, 10);
 
-        label = new Label { AutoSize = true, Font = new Font("Segoe UI Semibold", 11f), Margin = new Padding(0, 0, 0, 6) };
-
-        var postpone = MakeLink("5 min uitstellen", () => PostponeClicked?.Invoke());
-        var skip = MakeLink("Overslaan", () => SkipClicked?.Invoke());
-
-        var links = new FlowLayoutPanel { AutoSize = true, Margin = Padding.Empty, WrapContents = false };
-        links.Controls.AddRange([postpone, skip]);
+        label = new Label { AutoSize = true, Font = new Font("Segoe UI Semibold", 11f), Margin = Padding.Empty };
 
         var layout = new FlowLayoutPanel
         {
@@ -36,23 +28,18 @@ class WarningForm : Form
             WrapContents = false,
             Margin = Padding.Empty,
         };
-        layout.Controls.AddRange([label, links]);
-        Controls.Add(layout);
-    }
-
-    static LinkLabel MakeLink(string text, Action onClick)
-    {
-        var link = new LinkLabel
+        layout.Controls.Add(label);
+        if (dismissable)
         {
-            Text = text,
-            AutoSize = true,
-            LinkColor = Color.FromArgb(140, 200, 255),
-            ActiveLinkColor = Color.White,
-            LinkBehavior = LinkBehavior.HoverUnderline,
-            Margin = new Padding(0, 0, 16, 0),
-        };
-        link.LinkClicked += (_, _) => onClick();
-        return link;
+            layout.Controls.Add(new Label
+            {
+                Text = "Beweeg de muis of typ om uit te stellen",
+                AutoSize = true,
+                ForeColor = Color.FromArgb(170, 175, 185),
+                Margin = new Padding(0, 4, 0, 0),
+            });
+        }
+        Controls.Add(layout);
     }
 
     public void SetSeconds(int seconds) => label.Text = $"Pauze over {seconds} s";

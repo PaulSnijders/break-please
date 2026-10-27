@@ -2,7 +2,9 @@ namespace BreakPlease;
 
 class SettingsForm : Form
 {
-    readonly NumericUpDown interval = Number(1, 240);
+    readonly NumericUpDown minInterval = Number(1, 240);
+    readonly NumericUpDown maxInterval = Number(1, 240);
+    readonly NumericUpDown quietSeconds = Number(1, 120);
     readonly NumericUpDown breakSeconds = Number(5, 600);
     readonly NumericUpDown warningSeconds = Number(0, 120);
     readonly NumericUpDown idleSeconds = Number(10, 3600);
@@ -20,7 +22,9 @@ class SettingsForm : Form
         Font = new Font("Segoe UI", 9.5f);
         Padding = new Padding(12);
 
-        interval.Value = s.IntervalMinutes;
+        minInterval.Value = s.MinIntervalMinutes;
+        maxInterval.Value = s.MaxIntervalMinutes;
+        quietSeconds.Value = s.QuietSeconds;
         breakSeconds.Value = s.BreakSeconds;
         warningSeconds.Value = s.WarningSeconds;
         idleSeconds.Value = s.IdleResetSeconds;
@@ -28,7 +32,9 @@ class SettingsForm : Form
         autostart.Checked = s.StartWithWindows;
 
         var grid = new TableLayoutPanel { AutoSize = true, ColumnCount = 2, Dock = DockStyle.Fill };
-        AddRow(grid, "Pauze elke (minuten)", interval);
+        AddRow(grid, "Pauze op rustig moment na (minuten)", minInterval);
+        AddRow(grid, "Pauze uiterlijk na (minuten)", maxInterval);
+        AddRow(grid, "Rustig moment: geen invoer (seconden)", quietSeconds);
         AddRow(grid, "Pauzeduur (seconden)", breakSeconds);
         AddRow(grid, "Waarschuwing vooraf (seconden)", warningSeconds);
         AddRow(grid, "Timer resetten na inactiviteit (seconden)", idleSeconds);
@@ -49,7 +55,9 @@ class SettingsForm : Form
 
     public void ApplyTo(Settings s)
     {
-        s.IntervalMinutes = (int)interval.Value;
+        s.MinIntervalMinutes = (int)minInterval.Value;
+        s.MaxIntervalMinutes = Math.Max(s.MinIntervalMinutes, (int)maxInterval.Value);
+        s.QuietSeconds = (int)quietSeconds.Value;
         s.BreakSeconds = (int)breakSeconds.Value;
         s.WarningSeconds = (int)warningSeconds.Value;
         s.IdleResetSeconds = (int)idleSeconds.Value;
